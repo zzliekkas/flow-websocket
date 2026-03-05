@@ -337,6 +337,9 @@ func (m *Manager) RemoveConnection(conn *Connection) {
 	}
 	conn.mu.Unlock()
 
+	// 关闭底层Socket
+	conn.Socket.Close()
+
 	// 调用断开连接后钩子
 	if m.afterDisconnect != nil {
 		m.afterDisconnect(conn)
@@ -415,7 +418,6 @@ func (m *Manager) GetChannelConnections(channel string) ([]*Connection, error) {
 func (c *Connection) readPump() {
 	defer func() {
 		c.Manager.RemoveConnection(c)
-		c.Socket.Close()
 	}()
 
 	c.Socket.SetReadLimit(4096) // 设置最大消息大小
@@ -489,40 +491,32 @@ func (c *Connection) writePump() {
 		case msg, ok := <-c.SendChan:
 			c.Socket.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if !ok {
-				// 通道已关闭
 				c.Socket.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
-			w, err := c.Socket.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-
-			// 序列化消息
+			// 序列化并发送当前消息
 			data, err := json.Marshal(msg)
 			if err != nil {
 				fmt.Printf("序列化消息错误: %v\n", err)
 				continue
 			}
+			if err := c.Socket.WriteMessage(websocket.TextMessage, data); err != nil {
+				return
+			}
 
-			w.Write(data)
-
-			// 添加队列中的所有消息
+			// 发送队列中积压的消息，每条单独一个frame
 			n := len(c.SendChan)
 			for i := 0; i < n; i++ {
-				w.Write([]byte{'\n'})
 				nextMsg := <-c.SendChan
 				nextData, err := json.Marshal(nextMsg)
 				if err != nil {
 					fmt.Printf("序列化消息错误: %v\n", err)
 					continue
 				}
-				w.Write(nextData)
-			}
-
-			if err := w.Close(); err != nil {
-				return
+				if err := c.Socket.WriteMessage(websocket.TextMessage, nextData); err != nil {
+					return
+				}
 			}
 		case <-ticker.C:
 			c.Socket.SetWriteDeadline(time.Now().Add(10 * time.Second))

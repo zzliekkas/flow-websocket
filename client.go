@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -56,6 +57,9 @@ type Client struct {
 
 	// done 完成信号
 	done chan struct{}
+
+	// mu 互斥锁，保护并发访问
+	mu sync.Mutex
 }
 
 // NewClient 创建新的WebSocket客户端
@@ -75,13 +79,16 @@ func NewClient(url string) *Client {
 
 // Connect 连接到WebSocket服务器
 func (c *Client) Connect() error {
+	c.mu.Lock()
 	if !c.Closed {
+		c.mu.Unlock()
 		return errors.New("client already connected")
 	}
 
 	// 解析URL
 	u, err := url.Parse(c.URL)
 	if err != nil {
+		c.mu.Unlock()
 		return err
 	}
 
@@ -95,6 +102,7 @@ func (c *Client) Connect() error {
 	// 建立连接
 	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
+		c.mu.Unlock()
 		return err
 	}
 
@@ -102,6 +110,7 @@ func (c *Client) Connect() error {
 	c.Closed = false
 	c.reconnectCount = 0
 	c.done = make(chan struct{})
+	c.mu.Unlock()
 
 	// 启动读写协程
 	go c.readPump()
@@ -117,25 +126,32 @@ func (c *Client) Connect() error {
 
 // Close 关闭WebSocket连接
 func (c *Client) Close() {
+	c.mu.Lock()
 	if c.Closed {
+		c.mu.Unlock()
 		return
 	}
+	c.Closed = true
 
 	// 发送关闭信号
 	close(c.done)
 
-	// 关闭连接
-	if c.Connection != nil {
-		c.Connection.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		c.Connection.Close()
-	}
+	conn := c.Connection
+	c.mu.Unlock()
 
-	c.Closed = true
+	// 关闭连接
+	if conn != nil {
+		conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		conn.Close()
+	}
 }
 
 // Send 发送消息
 func (c *Client) Send(msg *Message) error {
-	if c.Closed {
+	c.mu.Lock()
+	closed := c.Closed
+	c.mu.Unlock()
+	if closed {
 		return errors.New("client is closed")
 	}
 
@@ -284,27 +300,41 @@ func (c *Client) handleMessage(msg *Message) {
 
 // handleDisconnect 处理断开连接
 func (c *Client) handleDisconnect(err error) {
+	c.mu.Lock()
 	if c.Closed {
+		c.mu.Unlock()
 		return
 	}
+	c.Closed = true
+	conn := c.Connection
+	reconnectCount := c.reconnectCount
+	maxAttempts := c.MaxReconnectAttempts
+	c.mu.Unlock()
 
-	c.Connection.Close()
+	if conn != nil {
+		conn.Close()
+	}
 
 	// 调用断开连接回调
 	if c.OnDisconnect != nil {
 		c.OnDisconnect(err)
 	}
 
-	// 自动重连
-	if c.reconnectCount < c.MaxReconnectAttempts {
-		c.reconnectCount++
+	// 自动重连（非递归，使用循环）
+	for reconnectCount < maxAttempts {
+		reconnectCount++
+		c.mu.Lock()
+		c.reconnectCount = reconnectCount
+		c.mu.Unlock()
+
 		time.Sleep(c.ReconnectInterval)
 
-		// 尝试重连
-		if err := c.Connect(); err != nil && c.OnError != nil {
-			c.OnError(fmt.Errorf("重连失败: %v", err))
+		if connErr := c.Connect(); connErr != nil {
+			if c.OnError != nil {
+				c.OnError(fmt.Errorf("重连失败 (%d/%d): %v", reconnectCount, maxAttempts, connErr))
+			}
+			continue
 		}
-	} else {
-		c.Closed = true
+		return
 	}
 }
