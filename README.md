@@ -1,6 +1,6 @@
 # flow-websocket
  
- WebSocket client/server utilities extracted from `github.com/zzliekkas/flow/v2/websocket`.
+ WebSocket client/server utilities extracted from `github.com/zzliekkas/flow/v3/websocket`.
  
  ## Install
  

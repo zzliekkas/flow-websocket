@@ -3,13 +3,13 @@ package websocket
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/zzliekkas/flow/v3"
 )
 
 var (
@@ -115,8 +115,19 @@ type Manager struct {
 	// upgrader WebSocket升级器
 	upgrader websocket.Upgrader
 
+	// logger 日志输出，默认使用 flow 框架全局日志
+	logger flow.Logger
+
 	// mu 互斥锁
 	mu sync.RWMutex
+}
+
+// logf 返回实际使用的 logger，默认回落到 flow 全局 logger
+func (m *Manager) logf() flow.Logger {
+	if m.logger != nil {
+		return m.logger
+	}
+	return flow.GetLogger()
 }
 
 // NewManager 创建新的WebSocket管理器
@@ -161,6 +172,12 @@ func (m *Manager) SetMessageHandler(fn func(conn *Connection, msg *Message) erro
 // SetUpgrader 设置WebSocket升级器
 func (m *Manager) SetUpgrader(upgrader websocket.Upgrader) {
 	m.upgrader = upgrader
+}
+
+// SetLogger 设置 WebSocket 管理器的日志实例
+// 传入 nil 时会回落到 flow 框架的全局 logger
+func (m *Manager) SetLogger(logger flow.Logger) {
+	m.logger = logger
 }
 
 // HandleRequest 处理WebSocket连接请求
@@ -431,7 +448,7 @@ func (c *Connection) readPump() {
 		_, data, err := c.Socket.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				fmt.Printf("WebSocket错误: %v\n", err)
+				c.Manager.logf().Errorf("websocket unexpected close: %v", err)
 			}
 			break
 		}
@@ -439,7 +456,7 @@ func (c *Connection) readPump() {
 		// 解析消息
 		var msg Message
 		if err := json.Unmarshal(data, &msg); err != nil {
-			fmt.Printf("解析消息错误: %v\n", err)
+			c.Manager.logf().Errorf("websocket decode message failed: %v", err)
 			continue
 		}
 
@@ -452,7 +469,7 @@ func (c *Connection) readPump() {
 		// 调用消息处理函数（如果设置了）
 		if c.Manager.messageHandler != nil {
 			if err := c.Manager.messageHandler(c, &msg); err != nil {
-				fmt.Printf("处理消息错误: %v\n", err)
+				c.Manager.logf().Errorf("websocket handle message failed: %v", err)
 				continue
 			}
 		}
@@ -498,7 +515,7 @@ func (c *Connection) writePump() {
 			// 序列化并发送当前消息
 			data, err := json.Marshal(msg)
 			if err != nil {
-				fmt.Printf("序列化消息错误: %v\n", err)
+				c.Manager.logf().Errorf("websocket encode message failed: %v", err)
 				continue
 			}
 			if err := c.Socket.WriteMessage(websocket.TextMessage, data); err != nil {
@@ -511,7 +528,7 @@ func (c *Connection) writePump() {
 				nextMsg := <-c.SendChan
 				nextData, err := json.Marshal(nextMsg)
 				if err != nil {
-					fmt.Printf("序列化消息错误: %v\n", err)
+					c.Manager.logf().Errorf("websocket encode message failed: %v", err)
 					continue
 				}
 				if err := c.Socket.WriteMessage(websocket.TextMessage, nextData); err != nil {
